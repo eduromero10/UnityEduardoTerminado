@@ -1,195 +1,174 @@
 using UnityEngine;
-using UnityEngine.InputSystem; // Nuevo Input System
+using UnityEngine.InputSystem;
 using TMPro;
-using UnityEngine.SceneManagement; // para cambiar / reiniciar escenas
+using UnityEngine.SceneManagement;
 
 public class PlayerController : MonoBehaviour
 {
     [Header("Movimiento")]
-    [SerializeField] private float speed = 10f;
+    [SerializeField] float acceleration = 35f;
+    [SerializeField] float maxSpeed = 8.5f;
+    [SerializeField] float airControl = 0.6f;
 
     [Header("Salto")]
-    [SerializeField] private float jumpForce = 6f;          // fuerza del salto
-    [SerializeField] private float jumpCooldown = 0.2f;     // evita doble tap instantáneo
-    [SerializeField] private Transform groundCheck;         // arrastra aquí el hijo GroundCheck
-    [SerializeField] private float groundRadius = 0.5f;     // radio de la sonda al suelo
-    [SerializeField] private LayerMask groundMask;          // ⬅️ SOLO la capa Ground
+    [SerializeField] float jumpImpulse = 7.5f;
+    [SerializeField] float coyoteTime = 0.12f;
+    [SerializeField] float jumpBufferTime = 0.12f;
+    [SerializeField] float jumpCutMultiplier = 0.5f;
+    [SerializeField] Transform groundCheck;
+    [SerializeField] float groundCheckRadius = 0.25f;
+    [SerializeField] LayerMask groundMask;
 
     [Header("UI")]
     public TMP_Text countText;
-    public TMP_Text winText;
+    public GameObject winMessage;
 
-    [Header("Escenas / Reinicio")]
-    [SerializeField] private string nextSceneName = "";     // nombre de la siguiente escena (Build Settings)
-    [SerializeField] private string pickupTag = "PickUp";   // tag de los coleccionables
-    [SerializeField] private string enemyTag = "Enemy";     // tag del enemigo
-    [SerializeField] private string finishTag = "Finish";   // tag de zona de meta (opcional)
+    [Header("Fin de nivel")]
+    [SerializeField] bool isLastLevel = false;        
+    [SerializeField] bool restartToFirstLevel = false; 
+    [SerializeField] bool finishOnAllPickups = false;  
+    [SerializeField] GameObject finishPortal;          
+    [SerializeField] string finishTag = "Finish";
+    [SerializeField] string pickupTag = "PickUp";
 
-    // --- Privados ---
-    private Rigidbody rb;
-    private bool canJump = true;
-    private bool isGrounded;
-    private bool gameFinished = false;
+    Rigidbody rb;
+    bool finished;
+    bool grounded;
 
-    private float movementX;
-    private float movementY;
+    float moveX, moveY;
+    int count, total;
+    float coyote, buffer;
 
-    private int count;
-
-    private void Start()
+    void Start()
     {
         rb = GetComponent<Rigidbody>();
         if (groundCheck == null) groundCheck = transform;
 
-        count = 0;
-        SetCountText();
+        total = GameObject.FindGameObjectsWithTag(pickupTag).Length;
 
-        if (winText != null)
-            winText.gameObject.SetActive(false);
+        if (finishPortal != null) finishPortal.SetActive(false);
+        if (winMessage != null) winMessage.SetActive(false);
+
+        UpdateUI();
     }
 
-    private void Update()
+    void Update()
     {
-        // --- Detección de suelo robusta ---
-        isGrounded = Physics.CheckSphere(
-            groundCheck.position,
-            groundRadius,
-            groundMask,
-            QueryTriggerInteraction.Ignore
-        );
+        if (Keyboard.current != null && Keyboard.current.rKey.wasPressedThisFrame)
+            Restart();
 
-        if (!isGrounded)
-        {
-            isGrounded = Physics.Raycast(
-                groundCheck.position + Vector3.up * 0.05f,
-                Vector3.down,
-                0.12f,
-                groundMask,
-                QueryTriggerInteraction.Ignore
-            );
-        }
+        if (finished) return;
 
-        // Input System + fallback clásico
-        bool spacePressed =
-            (Keyboard.current != null && Keyboard.current.spaceKey.wasPressedThisFrame)
-            || Input.GetKeyDown(KeyCode.Space);
+        grounded = Physics.CheckSphere(groundCheck.position, groundCheckRadius, groundMask, QueryTriggerInteraction.Ignore);
 
-        // Saltar
-        if (spacePressed && isGrounded && canJump && !gameFinished)
+        coyote = grounded ? coyoteTime : coyote - Time.deltaTime;
+
+        bool jumpDown = (Keyboard.current != null && Keyboard.current.spaceKey.wasPressedThisFrame) || Input.GetKeyDown(KeyCode.Space);
+        bool jumpUp   = (Keyboard.current != null && Keyboard.current.spaceKey.wasReleasedThisFrame) || Input.GetKeyUp(KeyCode.Space);
+
+        buffer = jumpDown ? jumpBufferTime : buffer - Time.deltaTime;
+
+        if (buffer > 0f && coyote > 0f)
         {
             Jump();
+            buffer = 0f;
+            coyote = 0f;
         }
 
-        // Reiniciar nivel con tecla R (cuando quieras)
-        if (Keyboard.current != null && Keyboard.current.rKey.wasPressedThisFrame)
+        if (jumpUp && rb.linearVelocity.y > 0f)
+            rb.linearVelocity = new Vector3(rb.linearVelocity.x, rb.linearVelocity.y * jumpCutMultiplier, rb.linearVelocity.z);
+    }
+
+    void FixedUpdate()
+    {
+        if (finished) return;
+
+        float control = grounded ? 1f : airControl;
+
+        rb.AddForce(new Vector3(moveX, 0f, moveY) * (acceleration * control), ForceMode.Acceleration);
+
+        Vector3 v = rb.linearVelocity;
+        Vector3 h = new Vector3(v.x, 0f, v.z);
+        if (h.magnitude > maxSpeed)
         {
-            RestartLevel();
+            h = h.normalized * maxSpeed;
+            rb.linearVelocity = new Vector3(h.x, v.y, h.z);
         }
     }
 
-    private void FixedUpdate()
+    void OnMove(InputValue value)
     {
-        if (gameFinished) return;
-
-        Vector3 movement = new Vector3(movementX, 0.0f, movementY);
-        rb.AddForce(movement * speed);
+        if (finished) return;
+        Vector2 v = value.Get<Vector2>();
+        moveX = v.x;
+        moveY = v.y;
     }
 
-    private void OnTriggerEnter(Collider other)
+    void OnTriggerEnter(Collider other)
     {
-        // Coleccionables
+        if (finished) return;
+
         if (other.CompareTag(pickupTag))
         {
             other.gameObject.SetActive(false);
             count++;
-            SetCountText();
+            UpdateUI();
+
+            if (finishOnAllPickups && count >= total)
+                Finish();
+
+            return;
         }
-        // Enemigo: reinicia el nivel
-        else if (other.CompareTag(enemyTag))
-        {
-            RestartLevel();
-        }
-        // Meta / zona de fin de nivel
-        else if (other.CompareTag(finishTag))
-        {
-            FinishGame();
-        }
+
+        if (!finishOnAllPickups && other.CompareTag(finishTag) && count >= total)
+            Finish();
     }
 
-    // Acción "Move" (Vector2) mapeada en tu InputActions + PlayerInput (Send Messages)
-    private void OnMove(InputValue movementValue)
-    {
-        Vector2 v = movementValue.Get<Vector2>();
-        movementX = v.x;
-        movementY = v.y;
-    }
-
-    private void Jump()
-    {
-        canJump = false;
-
-        // Normaliza salto (quita velocidad vertical previa)
-        Vector3 v = rb.linearVelocity;   // ARREGLADO: antes usabas linearVelocity (no existe)
-        v.y = 0f;
-        rb.linearVelocity = v;
-
-        // Impulso instantáneo hacia arriba
-        rb.AddForce(Vector3.up * jumpForce, ForceMode.VelocityChange);
-
-        // Cooldown para evitar dobles taps en el mismo frame de suelo
-        Invoke(nameof(ResetJump), jumpCooldown);
-    }
-
-    private void ResetJump() => canJump = true;
-
-    private void SetCountText()
+    void UpdateUI()
     {
         if (countText != null)
-            countText.text = "Count: " + count;
+            countText.text = $"Count: {count} / {total}";
 
-        // Cuando llegues a X coleccionables, muestra Win
-        if (winText != null && count >= 7 && !gameFinished)
-        {
-            winText.gameObject.SetActive(true);
-            winText.text = "¡Has recogido todos!";
-        }
+        if (!finishOnAllPickups && finishPortal != null && count >= total)
+            finishPortal.SetActive(true);
     }
 
-    private void FinishGame()
+    void Jump()
     {
-        gameFinished = true;
-
-        if (winText != null)
-        {
-            winText.gameObject.SetActive(true);
-            winText.text = "¡Nivel completado!";
-        }
-
-        // Cambia de escena si has puesto nombre en nextSceneName
-        if (!string.IsNullOrEmpty(nextSceneName))
-        {
-            Invoke(nameof(LoadNextLevel), 2f); // pequeña pausa
-        }
+        Vector3 v = rb.linearVelocity;
+        v.y = 0f;
+        rb.linearVelocity = v;
+        rb.AddForce(Vector3.up * jumpImpulse, ForceMode.Impulse);
     }
 
-    private void LoadNextLevel()
+    void Finish()
     {
-        if (!string.IsNullOrEmpty(nextSceneName))
-        {
-            SceneManager.LoadScene(nextSceneName);
-        }
+        finished = true;
+
+        moveX = moveY = 0f;
+        rb.linearVelocity = Vector3.zero;
+        rb.angularVelocity = Vector3.zero;
+        rb.isKinematic = true;
+
+        if (winMessage != null) winMessage.SetActive(true);
+        else Debug.LogWarning("winMessage no asignado en esta escena.");
+
+        if (!isLastLevel && !finishOnAllPickups)
+            Invoke(nameof(LoadNext), 2f);
     }
 
-    private void RestartLevel()
+    void LoadNext()
     {
-        Scene scene = SceneManager.GetActiveScene();
-        SceneManager.LoadScene(scene.buildIndex);
+        SceneManager.LoadScene(SceneManager.GetActiveScene().buildIndex + 1);
     }
 
-    private void OnDrawGizmosSelected()
+    void Restart()
     {
-        if (groundCheck == null) return;
-        Gizmos.color = Color.yellow;
-        Gizmos.DrawWireSphere(groundCheck.position, groundRadius);
+        SceneManager.LoadScene(restartToFirstLevel ? 0 : SceneManager.GetActiveScene().buildIndex);
     }
+    public bool IsGameFinished()
+{
+    return finished;
+}
+
 }
